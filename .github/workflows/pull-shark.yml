@@ -1,0 +1,103 @@
+name: Pull Shark Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      prs_to_create:
+        description: 'Cantidad de PRs a crear y fusionar (ej: 50, 100, 250, 1024)'
+        required: true
+        default: '50'
+        type: string
+      delay_seconds:
+        description: 'Pausa en segundos entre PRs (para evitar rate limit de GitHub)'
+        required: false
+        default: '2'
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  farm-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git User
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Run PR Loop
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TOTAL_PRS: ${{ github.event.inputs.prs_to_create }}
+          DELAY: ${{ github.event.inputs.delay_seconds }}
+        run: |
+          echo "Iniciando ciclo para $TOTAL_PRS PRs..."
+          
+          # Asegurar que estamos en main actualizado
+          git checkout main
+          git pull origin main || true
+
+          for ((i=1; i<=TOTAL_PRS; i++)); do
+            echo "--------------------------------------------------"
+            echo "Iteración $i de $TOTAL_PRS"
+            echo "--------------------------------------------------"
+
+            BRANCH="benchmark-run-$i-$(date +%s%N)"
+
+            # Crear rama desde main limpio
+            git checkout -b "$BRANCH" main
+
+            # Registrar cambio único en benchmarks.txt
+            echo "Run #$i: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> benchmarks.txt
+
+            git add benchmarks.txt
+            git commit -m "chore(benchmark): execution log #$i"
+
+            # Subir rama
+            git push origin "$BRANCH"
+
+            # Crear Pull Request
+            PR_URL=$(gh pr create \
+              --title "chore(benchmark): execution log #$i" \
+              --body "Automated benchmark execution #$i" \
+              --base main \
+              --head "$BRANCH")
+
+            echo "PR creado: $PR_URL"
+
+            # Fusionar con reintentos para permitir que GitHub calcule el mergeability
+            MERGED=0
+            for attempt in {1..5}; do
+              sleep 1
+              if gh pr merge "$PR_URL" --squash --delete-branch; then
+                echo "PR $i fusionado correctamente."
+                MERGED=1
+                break
+              fi
+              echo "Reintentando merge en 2s (intento $attempt)..."
+              sleep 2
+            done
+
+            if [ $MERGED -ne 1 ]; then
+              echo "Error: No se pudo fusionar el PR $PR_URL tras varios intentos."
+              exit 1
+            fi
+
+            # Volver a main y actualizar
+            git checkout main
+            git pull origin main
+
+            # Pausa para evitar rate limits secundarios
+            sleep "$DELAY"
+          done
+
+          echo "¡Completados con éxito $TOTAL_PRS PRs!"
